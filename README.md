@@ -53,6 +53,43 @@ from ipyh import Harness
 agent = Harness.from_config("runs/smol/harness") + model
 ```
 
+## Running the optimization step
+
+`step` hands each stage (INV, DOM, compose, reflect) to an editor: a coding agent that reads the
+stage's prompt file and edits a copy of the harness. Pick one of three ways to run it.
+
+**Claude Code, unattended (default).** Install [Claude Code](https://claude.com/claude-code), log in
+once, then:
+
+```bash
+ipyh-optimize step runs/smol
+```
+
+Each stage runs `claude -p` with file edits allowed only inside the run, the library and the input
+cache. Logs go to `runs/smol/round-<k>/logs/`. A stage has 30 minutes by default (`--editor-timeout`).
+
+**Any other coding agent.** Pass a command template. `{instruction}` is a one-line request telling
+the agent which prompt file to follow:
+
+```bash
+ipyh-optimize step runs/smol --editor "opencode run {instruction}"
+ipyh-optimize step runs/smol --editor "codex exec --full-auto {instruction}"
+```
+
+The template can also use `{prompt_file}`, `{workdir}`, `{run_dir}`, `{library}`, `{cache}` and
+`{python}`. The agent needs to read and write files and run `python` (for `validate`).
+
+**By hand, or in an interactive Claude Code session.** With `--editor none`, `step` stops at each
+stage and prints the prompt file to follow:
+
+```bash
+ipyh-optimize step runs/smol --editor none   # repeat after each stage; exit code 3 means a stage is waiting
+```
+
+From a clone of this repo, Claude Code picks up the bundled `optimize-harness` skill, so you can just
+ask it to "optimize the harness for runs/smol" and it plays every stage for you. The skill lives in
+`.claude/skills/optimize-harness/`; copy it to `~/.claude/skills/` to use it from other projects.
+
 Tasks are read in the [Harbor](https://github.com/laude-institute/harbor) format: `task.toml`,
 `instruction.md`, `tests/`. Input data is pulled from the HF bucket named in the task's environment.
 
