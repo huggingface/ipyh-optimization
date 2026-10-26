@@ -222,3 +222,18 @@ def test_stop_tool_ends_the_run_only_on_success(tmp_path):
     config["agent"]["stop_tools"] = ["missing"]
     (folder / HARNESS_FILE).write_text(json.dumps(config))
     assert any("not kernel tools" in e for e in validate_harness(folder, smoke=False))
+
+
+def test_continue_from_keeps_heldout_and_draws_new_train(suite, tmp_path):
+    first = loop.init_run(tmp_path / "r1", suite, n_train=4, n_heldout=3, cache=tmp_path / "cache")
+    Harness(system_prompt="Round one. {python}").save(first / "harness")
+    (first / "harness" / "CHANGELOG.md").write_text("- [INV] round one\n")
+    second = loop.init_run(tmp_path / "r2", n_train=4, continue_from=first)
+    s1 = json.loads((first / "splits.json").read_text())
+    s2 = json.loads((second / "splits.json").read_text())
+    assert s2["heldout"] == s1["heldout"]
+    assert not set(s2["train"]) & (set(s1["train"]) | set(s1["heldout"]))
+    assert "Round one." in (second / "base" / "system_prompt.md").read_text()
+    assert (second / "base" / "CHANGELOG.md").is_file()
+    config = json.loads((second / "config.json").read_text())
+    assert config["cache"] == str((tmp_path / "cache").resolve()) and config["continued_from"] == str(first)

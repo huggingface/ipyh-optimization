@@ -23,7 +23,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, Iterable, List, Optional
 
 try:
     import tomllib
@@ -117,9 +117,11 @@ def load_tasks(root: Path, ids: Optional[List[str]] = None) -> List[Task]:
     return [load_task(p.parent) for p in sorted(root.glob("*/task.toml"))]
 
 
-def stage_inputs(task: Task, cache: Path, max_bytes: Optional[int] = None) -> Path:
+def stage_inputs(task: Task, cache: Path, max_bytes: Optional[int] = None,
+                 extensions: Optional[Iterable[str]] = None) -> Path:
     """Downloads the task's input files from its HF bucket into `cache/<prefix>` (shared by the
-    tasks on one dataset) and returns that folder. Files over `max_bytes` are skipped."""
+    tasks on one dataset) and returns that folder. Files over `max_bytes`, or whose extension is not
+    in `extensions`, are skipped and listed in `.skipped` (name, size, reason)."""
     from huggingface_hub import download_bucket_files, list_bucket_tree
 
     folder = Path(cache) / task.bucket_prefix.strip("/")
@@ -134,8 +136,11 @@ def stage_inputs(task: Task, cache: Path, max_bytes: Optional[int] = None) -> Pa
         local = folder / Path(item.path).name
         if local.exists() and local.stat().st_size == item.size:
             continue
+        if extensions is not None and local.suffix.lower() not in extensions:
+            skipped.append(f"{local.name}\t{item.size}\tnot profiled")
+            continue
         if max_bytes and item.size > max_bytes:
-            skipped.append(f"{local.name}\t{item.size}")
+            skipped.append(f"{local.name}\t{item.size}\ttoo large")
             continue
         targets.append((item.path, str(local)))
     if targets:

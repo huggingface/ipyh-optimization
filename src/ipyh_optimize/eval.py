@@ -80,9 +80,9 @@ async def evaluate(harnesses: Dict[str, Path], tasks: List[Task], out: Path, bas
                                    max_turns, timeout_sec or task.agent_timeout_sec)
         result.update(harness=name, repeat=k)
         done += 1
-        if result["returncode"] and not result["turns"] and not result["timed_out"]:
-            # The agent crashed before its first model call: a setup problem, not a result. Nothing
-            # is saved, so the next `eval` retries it
+        if result["returncode"] and not result["timed_out"]:
+            # `python -m ipyh` exits non-zero only when the run itself broke (model API, setup), never for
+            # the agent's own errors: not a result. Nothing is saved, so the next `eval` retries it
             log = (folder / "agent.log").read_text(errors="replace").strip().splitlines()
             print(f"[{done}/{len(jobs)}] {name} {task.id}: CRASHED, not recorded: {log[-1] if log else '?'}", flush=True)
             return {**result, "crashed": True}

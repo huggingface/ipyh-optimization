@@ -59,24 +59,43 @@ DEFAULT_EDITOR = (
 EDITOR_TIMEOUT_SEC = 1800
 
 
-def init_run(root: Path, tasks_dir: Path, base: Optional[Path] = None, n_train: int = 200,
+def init_run(root: Path, tasks_dir: Optional[Path] = None, base: Optional[Path] = None, n_train: int = 200,
              n_heldout: int = 100, rounds: int = 1, seed: int = 0, library: Optional[Path] = None,
-             cache: Optional[Path] = None, domain: Optional[str] = None) -> Path:
-    """Creates the run folder: the splits, and the base harness (ipyh's default when `base` is None)."""
-    root, tasks_dir = Path(root).resolve(), Path(tasks_dir).expanduser().resolve()
+             cache: Optional[Path] = None, domain: Optional[str] = None,
+             continue_from: Optional[Path] = None) -> Path:
+    """Creates the run folder: the splits, and the base harness (ipyh's default when `base` is None).
+
+    With `continue_from` (an earlier run), the new run keeps that run's held-out tasks, draws train
+    tasks it has not used, and by default starts from its harness, library, tasks and cache."""
+    root = Path(root).resolve()
     if (root / "config.json").exists():
         raise FileExistsError(f"{root} already holds a run")
+    previous, heldout, exclude = {}, None, ()
+    if continue_from:
+        continue_from = Path(continue_from).resolve()
+        previous = json.loads((continue_from / "config.json").read_text())
+        earlier = json.loads((continue_from / "splits.json").read_text())
+        heldout, exclude = earlier["heldout"], earlier["train"] + earlier.get("excluded", [])
+        base = base or continue_from / "harness"
+    tasks_dir = Path(tasks_dir or previous["tasks"]).expanduser().resolve()
     tasks = load_tasks(tasks_dir)
-    splits = make_splits(tasks, n_train, n_heldout, rounds, seed)
+    splits = make_splits(tasks, n_train, n_heldout, rounds, seed, heldout=heldout, exclude=exclude)
+    if continue_from:
+        splits["excluded"] = list(exclude)  # every train task of the earlier runs, for the next one
     root.mkdir(parents=True, exist_ok=True)
     (Harness.from_config(base) if base else Harness()).save(root / "base")
+    if base and (Path(base) / "CHANGELOG.md").is_file():  # the editors read how the base came to be
+        shutil.copy(Path(base) / "CHANGELOG.md", root / "base" / "CHANGELOG.md")
     _write_json(root / "splits.json", splits)
+    library = library or previous.get("library")
+    cache = cache or previous.get("cache")
     _write_json(root / "config.json", {
         "tasks": str(tasks_dir),
         "rounds": rounds,
-        "domain": domain or tasks_dir.name,
+        "domain": domain or previous.get("domain") or tasks_dir.name,
         "library": str(Path(library).expanduser().resolve() if library else root / "library"),
         "cache": str(Path(cache).expanduser().resolve() if cache else DEFAULT_CACHE),
+        **({"continued_from": str(continue_from)} if continue_from else {}),
     })
     return root
 

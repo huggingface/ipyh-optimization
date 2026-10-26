@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import random
 from collections import defaultdict
-from typing import Dict, List
+from typing import Dict, Iterable, List, Optional
 
 from ipyh_optimize.tasks import Task
 
@@ -38,12 +38,20 @@ def stratified_order(tasks: List[Task], seed: int = 0) -> List[Task]:
     return [task for *_, task in sorted(keyed, key=lambda key: key[:2])]
 
 
-def make_splits(tasks: List[Task], n_train: int, n_heldout: int, rounds: int = 1, seed: int = 0) -> dict:
-    """{"heldout": ids, "train": ids, "rounds": [ids per round]}; the rounds partition `train`."""
-    if n_train + n_heldout > len(tasks):
-        raise ValueError(f"asked for {n_train} + {n_heldout} tasks, the suite has {len(tasks)}")
+def make_splits(tasks: List[Task], n_train: int, n_heldout: int, rounds: int = 1, seed: int = 0,
+                heldout: Optional[List[str]] = None, exclude: Iterable[str] = ()) -> dict:
+    """{"heldout": ids, "train": ids, "rounds": [ids per round]}; the rounds partition `train`.
+
+    A continued run passes the earlier `heldout` (kept as is, so every version is scored on the same
+    tasks) and the earlier train tasks as `exclude`, so its train tasks are new."""
     order = [task.id for task in stratified_order(tasks, seed)]
-    heldout, train = order[:n_heldout], order[n_heldout:n_heldout + n_train]
+    if heldout is None:
+        heldout, order = order[:n_heldout], order[n_heldout:]
+    unused = set(heldout) | set(exclude)
+    order = [task_id for task_id in order if task_id not in unused]
+    if n_train > len(order):
+        raise ValueError(f"asked for {n_train} train tasks, {len(order)} are left")
+    train = order[:n_train]
     return {
         "seed": seed,
         "heldout": heldout,

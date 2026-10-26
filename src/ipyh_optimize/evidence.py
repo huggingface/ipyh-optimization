@@ -42,6 +42,8 @@ from ipyh_optimize.tasks import Task, stage_inputs
 
 PROFILE_ROWS = 50_000  # rows read to profile a table; the row count itself is exact
 TABLE_EXTENSIONS = {".csv", ".tsv", ".txt", ".data", ".dat"}
+# Files `profile_file` can read; the others (images, audio, documents) are listed, not downloaded
+PROFILED_EXTENSIONS = TABLE_EXTENSIONS | {".xlsx", ".xls", ".json", ".parquet", ".sqlite", ".db", ".sqlite3"}
 MISSING_TOKENS = {"?", "-", "--", "na", "n/a", "nan", "none", "null", "missing", "unknown", " "}
 DATE_LIKE = re.compile(r"^\d{4}[-/]\d{1,2}[-/]\d{1,2}|^\d{1,2}[-/]\d{1,2}[-/]\d{2,4}")
 NUMBER_AS_TEXT = re.compile(r"^\s*[-+$€£]?\s*[\d,]+(\.\d+)?\s*%?\s*$")
@@ -79,12 +81,24 @@ def build_evidence(tasks: List[Task], harness_dir: Path, out: Path, cache: Path,
         by_dataset[task.bucket_prefix.strip("/")].append(task)
 
     def profile_dataset(name: str) -> List[dict]:
-        folder = stage_inputs(by_dataset[name][0], cache, max_bytes=int(max_file_mb * 2**20))
-        profiles = [profile_file(path) for path in sorted(folder.iterdir()) if not path.name.startswith(".")]
+        folder = stage_inputs(by_dataset[name][0], cache, max_bytes=int(max_file_mb * 2**20),
+                              extensions=PROFILED_EXTENSIONS)
+        files = sorted(path for path in folder.iterdir() if not path.name.startswith("."))
+        profiles = [profile_file(path) for path in files if path.suffix.lower() in PROFILED_EXTENSIONS]
+        others = defaultdict(list)  # extension -> sizes of the files that are not tables
+        for path in files:
+            if path.suffix.lower() not in PROFILED_EXTENSIONS:
+                others[path.suffix.lower() or "none"].append(path.stat().st_size)
         for line in (folder / ".skipped").read_text().splitlines():
-            file_name, size = line.split("\t")
-            profiles.append({"name": file_name, "size": int(size), "kind": "skipped",
-                             "quirks": [f"larger than {max_file_mb:.0f} MB: not downloaded for profiling"]})
+            file_name, size, reason = (line.split("\t") + ["too large"])[:3]
+            if reason == "too large":
+                profiles.append({"name": file_name, "size": int(size), "kind": "skipped",
+                                 "quirks": [f"larger than {max_file_mb:.0f} MB: not downloaded for profiling"]})
+            else:
+                others[Path(file_name).suffix.lower() or "none"].append(int(size))
+        for kind, sizes in sorted(others.items()):
+            profiles.append({"name": f"{len(sizes)} {kind} file(s)", "size": sum(sizes), "kind": kind,
+                             "count": len(sizes), "quirks": ["not a table: listed, not profiled"]})
         (out / "datasets" / f"{name}.md").write_text(render_dataset(name, profiles, by_dataset[name]))
         return profiles
 
@@ -254,11 +268,14 @@ def render_summary(tasks: List[Task], by_dataset: Dict[str, List[Task]], profile
     sizes = [p["size"] / 2**20 for p in files] or [0]
     files_per_task = [len(t.files) for t in tasks] or [0]
     lines += ["## Input files", "",
-              f"- {len(files)} files; size median {statistics.median(sizes):.1f} MB, max {max(sizes):.0f} MB; "
+              f"- {sum(p.get('count', 1) for p in files)} files; size median {statistics.median(sizes):.1f} MB, max {max(sizes):.0f} MB; "
               f"{sum(s > 100 for s in sizes)} over 100 MB",
               f"- files per task: median {statistics.median(files_per_task):.0f}, max {max(files_per_task)}; "
               f"{sum(f > 1 for f in files_per_task)} tasks have several files", ""]
-    lines += table(Counter(p["kind"] for p in files), len(files) or 1, "file type", "files")
+    kinds = Counter()
+    for p in files:
+        kinds[p["kind"]] += p.get("count", 1)
+    lines += table(kinds, sum(kinds.values()) or 1, "file type", "files")
 
     tasks_hit, datasets_hit = Counter(), defaultdict(list)
     for name, dataset in profiles.items():

@@ -42,7 +42,9 @@ def main(argv=None) -> None:
 
     p = commands.add_parser("init", help="create a run: splits and base harness")
     p.add_argument("run", type=Path)
-    p.add_argument("--tasks", type=Path, required=True, help="folder of Harbor tasks (or holding tasks/)")
+    p.add_argument("--tasks", type=Path, help="folder of Harbor tasks (or holding tasks/)")
+    p.add_argument("--continue-from", type=Path,
+                   help="an earlier run: keep its held-out tasks, draw unused train tasks, start from its harness")
     p.add_argument("--base", type=Path, help="harness folder or JSON to start from (default: ipyh's default)")
     p.add_argument("--train", type=int, default=200, help="tasks inspected to optimize")
     p.add_argument("--heldout", type=int, default=100, help="tasks kept for eval only")
@@ -84,8 +86,10 @@ def main(argv=None) -> None:
 
     args = parser.parse_args(argv)
     if args.command == "init":
+        if not (args.tasks or args.continue_from):
+            parser.error("init needs --tasks or --continue-from")
         root = init_run(args.run, args.tasks, args.base, args.train, args.heldout, args.rounds, args.seed,
-                        args.library, args.cache, args.domain)
+                        args.library, args.cache, args.domain, args.continue_from)
         print(f"run created at {root}; next: ipyh-optimize step {args.run}")
     elif args.command == "step":
         finished = step(args.run, None if args.editor == "none" else args.editor, args.editor_timeout)
