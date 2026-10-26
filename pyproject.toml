@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ipyh-optimization"
+version = "0.1.0"
+description = "Optimize an ipython-harness (ipyh) harness for a task suite, Harness²-style and without training"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.9"
+dependencies = [
+    # Harness folders (`Harness.from_config(folder)`, `Harness.save`) and `agent.stop_tools`
+    "ipyharness @ git+https://github.com/huggingface/ipython-harness",
+    "huggingface_hub>=1.0",
+    "pandas",
+    "tomli; python_version<'3.11'",
+]
+
+[project.optional-dependencies]
+# What the tasks' analyses import, for the agent's kernel during `eval`
+eval = ["numpy", "scipy", "scikit-learn", "statsmodels", "matplotlib", "seaborn", "tabulate", "plotly",
+        "math-verify", "openpyxl"]
+dev = ["pytest"]
+
+[project.scripts]
+ipyh-optimize = "ipyh_optimize.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+ipyh_optimize = ["prompts/*.md"]
