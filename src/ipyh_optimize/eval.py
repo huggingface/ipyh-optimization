@@ -40,6 +40,7 @@ from typing import Dict, List, Optional
 from ipyh_optimize.tasks import INPUT_DIR, WORK_DIR, Task, stage_inputs
 
 ANSWER_FILE = "answer.txt"
+SECRET_ENV = re.compile(r"TOKEN|KEY|SECRET|PASSWORD|CREDENTIAL", re.I)  # names kept out of the agent's environment
 TOOL_ERROR = re.compile(r"Traceback \(most recent call last\)|^\w*(Error|Exception)\b", re.M)
 
 
@@ -55,7 +56,10 @@ async def evaluate(harnesses: Dict[str, Path], tasks: List[Task], out: Path, bas
         folders = dict(zip(by_prefix, pool.map(lambda t: stage_inputs(t, cache), by_prefix.values())))
 
     semaphore = asyncio.Semaphore(concurrency)
-    env = {**os.environ, "OPENAI_API_KEY": os.environ.get(api_key_env, "EMPTY")}
+    # The agent's code runs with this environment: keep model and Hub credentials out of it. The
+    # model key reaches `python -m ipyh` as OPENAI_API_KEY, which it removes before starting the kernel
+    env = {k: v for k, v in os.environ.items() if not SECRET_ENV.search(k)}
+    env["OPENAI_API_KEY"] = os.environ.get(api_key_env, "EMPTY")
     # Interleaved, so a partial evaluation still compares the harnesses on the same tasks
     jobs = [(name, path, task, k) for task in tasks for k in range(repeats) for name, path in harnesses.items()]
     folder_of = lambda name, task, k: out / name / (task.id if repeats == 1 else f"{task.id}-r{k}")
