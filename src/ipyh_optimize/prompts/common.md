@@ -17,6 +17,7 @@ what the tasks ask, the data they ship with, and how the harness works. Do not o
 - `{{evidence}}/tasks.jsonl`: one card per task (question, answer kind, files, difficulty).
 - `{{evidence}}/datasets/<name>.md`: each dataset's file profiles (encoding, delimiter, columns,
   quirks, sample rows) and the questions asked about it.
+{{probe}}
 - `{{base}}/`: the harness you start from.
 - `{{library}}/`: lessons and harnesses from earlier optimizations (`EXPERIENCE.md`, `INDEX.md`),
   if any. Reuse what fits the evidence here; do not copy blindly.

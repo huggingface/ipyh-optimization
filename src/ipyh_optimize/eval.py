@@ -35,7 +35,7 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, Iterable, List, Optional
 
 from ipyh_optimize.tasks import INPUT_DIR, WORK_DIR, Task, stage_inputs
 
@@ -47,9 +47,18 @@ TOOL_ERROR = re.compile(r"Traceback \(most recent call last\)|^\w*(Error|Excepti
 async def evaluate(harnesses: Dict[str, Path], tasks: List[Task], out: Path, base_url: str,
                    model: Optional[str], cache: Path, concurrency: int = 8, repeats: int = 1,
                    max_turns: Optional[int] = None, timeout_sec: Optional[float] = None,
-                   api_key_env: str = "OPENAI_API_KEY") -> List[dict]:
-    """Runs every harness on every task `repeats` times; finished rollouts are reused."""
+                   api_key_env: str = "OPENAI_API_KEY", grade_answers: bool = True,
+                   private: Iterable[Path] = ()) -> List[dict]:
+    """Runs every harness on every task `repeats` times; finished rollouts are reused. With
+    `grade_answers=False` (probe rollouts, inside the label-free loop) the reward is None."""
     out = Path(out).resolve()  # each rollout runs in its own folder, so every path it gets is absolute
+    # What an agent must not read: other rollouts (their answers and grades), the task folders (their
+    # task.toml holds the gold answer) and the Hub token. On macOS each rollout is sandboxed to enforce it
+    private = [out, *private, *{task.path.parent for task in tasks}, Path.home() / ".cache" / "huggingface"]
+    private = sorted({Path(p).resolve() for p in private})
+    if not shutil.which("sandbox-exec"):
+        print("WARNING: no sandbox-exec: rollouts are not isolated from each other or from the task folders; "
+              "check results' `escape_attempts`, or run eval in a container", flush=True)
     print(f"staging inputs of {len(tasks)} tasks", flush=True)
     by_prefix = {task.bucket_prefix: task for task in tasks}
     with ThreadPoolExecutor(8) as pool:
@@ -77,7 +86,7 @@ async def evaluate(harnesses: Dict[str, Path], tasks: List[Task], out: Path, bas
             if folder.exists():  # an interrupted attempt: start clean, so a stale answer is never graded
                 shutil.rmtree(folder)
             result = await rollout(path, task, folder, folders[task.bucket_prefix], base_url, model, env,
-                                   max_turns, timeout_sec or task.agent_timeout_sec)
+                                   max_turns, timeout_sec or task.agent_timeout_sec, grade_answers, private)
         result.update(harness=name, repeat=k)
         done += 1
         if result["returncode"] and not result["timed_out"]:
@@ -95,7 +104,8 @@ async def evaluate(harnesses: Dict[str, Path], tasks: List[Task], out: Path, bas
 
 
 async def rollout(harness: Path, task: Task, folder: Path, inputs: Path, base_url: str, model: Optional[str],
-                  env: dict, max_turns: Optional[int], timeout_sec: float) -> dict:
+                  env: dict, max_turns: Optional[int], timeout_sec: float, grade_answers: bool = True,
+                  private: Iterable[Path] = ()) -> dict:
     input_dir, work_dir = folder / "input", folder / "workdir"
     for d in (input_dir, work_dir):
         d.mkdir(parents=True, exist_ok=True)
@@ -112,6 +122,10 @@ async def rollout(harness: Path, task: Task, folder: Path, inputs: Path, base_ur
         command += ["--model", model]
     if max_turns:
         command += ["--max-turns", str(max_turns)]
+    allowed = [folder.resolve(), Path(harness).resolve()]
+    if shutil.which("sandbox-exec"):
+        (folder / "sandbox.sb").write_text(sandbox_profile(private, allowed))
+        command = ["sandbox-exec", "-f", str(folder / "sandbox.sb"), *command]
 
     started, timed_out = time.monotonic(), False
     with (folder / "agent.log").open("w") as log:
@@ -132,7 +146,10 @@ async def rollout(harness: Path, task: Task, folder: Path, inputs: Path, base_ur
 
     answer_file = work_dir / ANSWER_FILE
     answer = answer_file.read_text(errors="replace").strip() if answer_file.exists() else ""
-    reward = await asyncio.to_thread(grade, task, answer, folder / "grade.log") if answer else 0.0
+    if not grade_answers:
+        reward = None
+    else:
+        reward = await asyncio.to_thread(grade, task, answer, folder / "grade.log") if answer else 0.0
     return {
         "task": task.id,
         "reward": reward,
@@ -144,6 +161,7 @@ async def rollout(harness: Path, task: Task, folder: Path, inputs: Path, base_ur
         "difficulty": task.metadata.get("difficulty_tier"),
         "answer_kind": task.answer_kind,
         **trajectory_metrics(folder / "trajectory.json"),
+        "escape_attempts": escape_attempts(folder / "trajectory.json", private, allowed),
     }
 
 
@@ -176,3 +194,30 @@ def trajectory_metrics(path: Path) -> dict:
         "tool_errors": sum(bool(TOOL_ERROR.search(str(m.get("content", "")))) for m in results),
         "finished": record["done"],
     }
+
+
+def sandbox_profile(private: Iterable[Path], allowed: Iterable[Path]) -> str:
+    """A macOS sandbox profile: everything is allowed except reading or writing `private`, apart from
+    the paths in `allowed` (the last matching rule wins)."""
+    paths = lambda ps: " ".join(f'(subpath "{p}")' for p in ps)
+    return (f"(version 1)\n(allow default)\n(deny file-read* file-write* {paths(private)})\n"
+            f"(allow file-read* file-write* {paths(allowed)})\n")
+
+
+def escape_attempts(path: Path, private: Iterable[Path], allowed: Iterable[Path]) -> int:
+    """Tool calls that named a private path outside the rollout's own folder and harness, or were
+    refused by the sandbox: an agent looking for answers elsewhere."""
+    if not path.exists():
+        return 0
+    private, allowed = [str(p) for p in private], [str(p) for p in allowed]
+    conversation = json.loads(path.read_text())["conversation"]
+    refused = {m.get("tool_call_id") for m in conversation
+               if m["role"] == "tool" and "Operation not permitted" in str(m.get("content", ""))}
+    count = 0
+    for message in conversation:
+        for call in message.get("tool_calls") or []:
+            named = re.findall(r"/[^\s'\"\\),;]+", call["function"].get("arguments") or "")
+            outside = any(any(p.startswith(root) for root in private) and not any(p.startswith(a) for a in allowed)
+                          for p in named)
+            count += bool(outside or call.get("id") in refused)
+    return count

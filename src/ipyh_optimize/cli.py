@@ -45,6 +45,16 @@ def main(argv=None) -> None:
     p.add_argument("--tasks", type=Path, help="folder of Harbor tasks (or holding tasks/)")
     p.add_argument("--continue-from", type=Path,
                    help="an earlier run: keep its held-out tasks, draw unused train tasks, start from its harness")
+    p.add_argument("--splits-from", type=Path,
+                   help="reuse another run's exact splits (for a controlled comparison between runs)")
+    p.add_argument("--probe", type=int, metavar="N",
+                   help="Harness² probing: run the base and each candidate on N train tasks (not graded) "
+                        "and give the editors the trajectories. Costs 3·N rollouts per round. Off by default")
+    p.add_argument("--probe-base-url", help="OpenAI-compatible URL of the model the probe runs")
+    p.add_argument("--probe-model")
+    p.add_argument("--probe-api-key-env", default="OPENAI_API_KEY")
+    p.add_argument("--probe-concurrency", type=int, default=8)
+    p.add_argument("--probe-timeout-sec", type=float, help="per probe rollout (default: the task's)")
     p.add_argument("--base", type=Path, help="harness folder or JSON to start from (default: ipyh's default)")
     p.add_argument("--train", type=int, default=200, help="tasks inspected to optimize")
     p.add_argument("--heldout", type=int, default=100, help="tasks kept for eval only")
@@ -86,10 +96,16 @@ def main(argv=None) -> None:
 
     args = parser.parse_args(argv)
     if args.command == "init":
-        if not (args.tasks or args.continue_from):
-            parser.error("init needs --tasks or --continue-from")
+        if not (args.tasks or args.continue_from or args.splits_from):
+            parser.error("init needs --tasks, --continue-from or --splits-from")
+        if args.probe and not args.probe_base_url:
+            parser.error("--probe needs --probe-base-url (and usually --probe-model)")
+        probe = None if not args.probe else {
+            "tasks": args.probe, "base_url": args.probe_base_url, "model": args.probe_model,
+            "api_key_env": args.probe_api_key_env, "concurrency": args.probe_concurrency,
+            "timeout_sec": args.probe_timeout_sec}
         root = init_run(args.run, args.tasks, args.base, args.train, args.heldout, args.rounds, args.seed,
-                        args.library, args.cache, args.domain, args.continue_from)
+                        args.library, args.cache, args.domain, args.continue_from, args.splits_from, probe)
         print(f"run created at {root}; next: ipyh-optimize step {args.run}")
     elif args.command == "step":
         finished = step(args.run, None if args.editor == "none" else args.editor, args.editor_timeout)
@@ -120,7 +136,7 @@ def run_eval(args) -> None:
     out = args.out or root / "eval"
     results = asyncio.run(evaluate(harnesses, load_tasks(Path(config["tasks"]), ids), out, args.base_url, args.model,
                                    Path(config["cache"]), args.concurrency, args.repeats, args.max_turns,
-                                   args.timeout_sec, args.api_key_env))
+                                   args.timeout_sec, args.api_key_env, private=[root.parent]))
     crashed = sum(bool(r.get("crashed")) for r in results)
     if crashed:
         print(f"{crashed} rollouts crashed before their first model call; see their agent.log, fix, and rerun "

@@ -44,12 +44,15 @@ from typing import Dict, List, Optional
 
 from ipyh.harness import HARNESS_FILE, Harness
 from ipyh_optimize.evidence import build_evidence
+from ipyh_optimize.probe import contrast, digest, run_probe
 from ipyh_optimize.select import make_splits
 from ipyh_optimize.tasks import load_tasks
 from ipyh_optimize.validate import validate_harness
 
 PROMPTS = Path(__file__).parent / "prompts"
 STAGES = ("inv", "dom", "compose", "reflect")
+# With probing: the round's base is run before the editors, and both candidates before the composer
+PROBE_STAGES = ("reference", "inv", "dom", "probe", "compose", "reflect")
 DEFAULT_CACHE = Path("~/.cache/ipyh-optimize/inputs").expanduser()
 # `{instruction}` points the editor at its prompt file; the other fields are paths
 DEFAULT_EDITOR = (
@@ -62,7 +65,8 @@ EDITOR_TIMEOUT_SEC = 1800
 def init_run(root: Path, tasks_dir: Optional[Path] = None, base: Optional[Path] = None, n_train: int = 200,
              n_heldout: int = 100, rounds: int = 1, seed: int = 0, library: Optional[Path] = None,
              cache: Optional[Path] = None, domain: Optional[str] = None,
-             continue_from: Optional[Path] = None) -> Path:
+             continue_from: Optional[Path] = None, splits_from: Optional[Path] = None,
+             probe: Optional[dict] = None) -> Path:
     """Creates the run folder: the splits, and the base harness (ipyh's default when `base` is None).
 
     With `continue_from` (an earlier run), the new run keeps that run's held-out tasks, draws train
@@ -77,9 +81,15 @@ def init_run(root: Path, tasks_dir: Optional[Path] = None, base: Optional[Path] 
         earlier = json.loads((continue_from / "splits.json").read_text())
         heldout, exclude = earlier["heldout"], earlier["train"] + earlier.get("excluded", [])
         base = base or continue_from / "harness"
+    if splits_from:  # the exact splits of another run, for a controlled comparison
+        splits_from = Path(splits_from).resolve()
+        previous = previous or json.loads((splits_from / "config.json").read_text())
     tasks_dir = Path(tasks_dir or previous["tasks"]).expanduser().resolve()
-    tasks = load_tasks(tasks_dir)
-    splits = make_splits(tasks, n_train, n_heldout, rounds, seed, heldout=heldout, exclude=exclude)
+    if splits_from:
+        splits = json.loads((splits_from / "splits.json").read_text())
+        rounds = len(splits["rounds"])
+    else:
+        splits = make_splits(load_tasks(tasks_dir), n_train, n_heldout, rounds, seed, heldout=heldout, exclude=exclude)
     if continue_from:
         splits["excluded"] = list(exclude)  # every train task of the earlier runs, for the next one
     root.mkdir(parents=True, exist_ok=True)
@@ -96,6 +106,8 @@ def init_run(root: Path, tasks_dir: Optional[Path] = None, base: Optional[Path] 
         "library": str(Path(library).expanduser().resolve() if library else root / "library"),
         "cache": str(Path(cache).expanduser().resolve() if cache else DEFAULT_CACHE),
         **({"continued_from": str(continue_from)} if continue_from else {}),
+        **({"splits_from": str(splits_from)} if splits_from else {}),
+        **({"probe": probe} if probe else {}),
     })
     return root
 
@@ -129,10 +141,12 @@ def step(root: Path, editor: Optional[str] = DEFAULT_EDITOR, editor_timeout: int
         }
         context = {**{key: str(value) for key, value in paths.items()},
                    "domain": config["domain"], "entry": f"{root.name}-round-{k}", "round": str(k)}
-        for stage in STAGES:
+        for stage in PROBE_STAGES if config.get("probe") else STAGES:
             if state.get(stage) == "done":
                 continue
-            if not run_stage(stage, context, state.get(stage), editor, editor_timeout):
+            if stage in ("reference", "probe"):
+                probe_stage(stage, paths, config, splits["rounds"][k - 1])
+            elif not run_stage(stage, context, state.get(stage), editor, editor_timeout):
                 state[stage] = "pending"
                 _write_json(state_file, state)
                 return False
@@ -218,6 +232,28 @@ def setup_stage(stage: str, workdir: Path, context: Dict[str, str]) -> None:
             (diffs / f"{role}.diff").write_text(result.stdout)
 
 
+def probe_stage(stage: str, paths: Dict[str, Path], config: dict, batch: List[str]) -> None:
+    """Runs the probe rollouts (never graded) and writes their digests into the round's evidence."""
+    settings = config["probe"]
+    tasks = load_tasks(Path(config["tasks"]), batch[: settings["tasks"]])
+    runs, out = paths["round_dir"] / "probe-runs", paths["evidence"] / "probe"
+    out.mkdir(parents=True, exist_ok=True)
+    harnesses = {"reference": paths["base"]} if stage == "reference" else {
+        "reference": paths["base"], "inv": paths["inv"], "dom": paths["dom"]}  # reference rollouts are reused
+    print(f"[{stage}] probing {', '.join(harnesses)} on {len(tasks)} train tasks", flush=True)
+    # The folder holding every run is off limits to the agent (other rollouts, evals, evidence)
+    results = run_probe(harnesses, tasks, runs, Path(config["cache"]), settings, private=[paths["run_dir"].parent])
+    crashed = sum(bool(r.get("crashed")) for r in results)
+    if crashed > len(results) // 2:  # e.g. a missing API key: do not hand the editors an empty probe
+        raise SystemExit(f"[{stage}] {crashed}/{len(results)} probe rollouts crashed; see their agent.log under "
+                         f"{runs}, fix (model URL, API key in ${settings.get('api_key_env')}) and run `step` again")
+    questions = {task.id: task.question for task in tasks}
+    for name in harnesses:
+        (out / f"{name}.md").write_text(digest(name, runs / name, questions))
+    if stage == "probe":
+        (out / "CONTRAST.md").write_text(contrast({name: runs / name for name in harnesses}))
+
+
 def render_prompt(stage: str, workdir: Path, context: Dict[str, str], errors: Optional[List[str]] = None) -> str:
     values = {
         **context,
@@ -228,6 +264,10 @@ def render_prompt(stage: str, workdir: Path, context: Dict[str, str], errors: Op
             "\n## Fix these first\nYour previous edit did not validate:\n" + "\n".join(f"- {e}" for e in errors)
         ),
     }
+    probe = Path(context["evidence"]) / "probe"
+    values["probe"] = _fill((PROMPTS / "probe.md").read_text(), values) if (probe / "reference.md").exists() else ""
+    values["probe_compose"] = (_fill((PROMPTS / "probe_compose.md").read_text(), values)
+                               if (probe / "CONTRAST.md").exists() else "")
     if stage != "reflect":
         values["common"] = _fill((PROMPTS / "common.md").read_text(), values)
     return _fill((PROMPTS / f"{stage}.md").read_text(), values)

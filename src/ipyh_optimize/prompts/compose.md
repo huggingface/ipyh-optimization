@@ -17,4 +17,5 @@ proposed edit, decide whether to **adopt**, **adapt** or **reject** it:
 
 In `CHANGELOG.md` keep the adopted entries, and add a `## Composer decisions` section with one
 line per proposed edit: `adopted | adapted | rejected — reason`.
+{{probe_compose}}
 {{errors}}

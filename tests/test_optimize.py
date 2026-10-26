@@ -237,3 +237,68 @@ def test_continue_from_keeps_heldout_and_draws_new_train(suite, tmp_path):
     assert (second / "base" / "CHANGELOG.md").is_file()
     config = json.loads((second / "config.json").read_text())
     assert config["cache"] == str((tmp_path / "cache").resolve()) and config["continued_from"] == str(first)
+
+
+def _fake_rollout(folder, turns, answer, after_answer=0, nudge=False, error=False):
+    """A finished rollout folder in the format `eval` writes."""
+    from ipyh.constants import NUDGE
+    folder.mkdir(parents=True)
+    conversation = [{"role": "system", "content": "s"}, {"role": "user", "content": "q"}]
+    for t in range(turns):
+        if t == turns - 1 - after_answer:
+            call = {"id": f"c{t}", "function": {"name": "submit_answer", "arguments": json.dumps({"value": answer, "path": "a"})}}
+            out = "Wrote"
+        else:
+            call = {"id": f"c{t}", "function": {"name": "ipython", "arguments": json.dumps({"code": f"x = {t}"})}}
+            out = "Traceback (most recent call last)\nKeyError: 'col'" if error and t == 0 else "ok"
+        conversation += [{"role": "assistant", "content": "", "tool_calls": [call]},
+                         {"role": "tool", "tool_call_id": call["id"], "content": out}]
+    if nudge:
+        conversation.append({"role": "user", "content": NUDGE})
+    (folder / "trajectory.json").write_text(json.dumps({"conversation": conversation, "turns": [{}] * turns}))
+    (folder / "result.json").write_text(json.dumps({
+        "task": folder.name, "turns": turns, "timed_out": False, "prompt_tokens": 100, "completion_tokens": 10,
+        "answer": answer, "reward": None}))
+
+
+def test_probe_digest_and_contrast(tmp_path):
+    from ipyh_optimize.probe import contrast, digest, rollout_facts
+    _fake_rollout(tmp_path / "ref" / "t1", turns=5, answer="58", after_answer=2, nudge=True, error=True)
+    _fake_rollout(tmp_path / "cand" / "t1", turns=3, answer="261")
+    facts = rollout_facts(tmp_path / "ref" / "t1")
+    assert facts["answer_turn"] == 3 and facts["after_answer"] == 2 and facts["nudges"] == 1 and facts["errors"] == 1
+    text = digest("ref", tmp_path / "ref", {"t1": "How many missing?"})
+    assert "2 turns after the answer" in text and "1 nudge(s)" in text and "ERROR KeyError" in text
+    table = contrast({"reference": tmp_path / "ref", "cand": tmp_path / "cand"})
+    assert "'261' ≠ref" in table and "'58'" in table
+
+
+def test_probe_stages_run_in_order(suite, tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(loop, "build_evidence", lambda tasks, base, out, cache: out.mkdir(parents=True))
+    def fake_probe(harnesses, tasks, out, cache, settings, private=()):
+        calls.append(sorted(harnesses))
+        for name in harnesses:
+            for task in tasks:
+                if not (out / name / task.id).exists():
+                    _fake_rollout(out / name / task.id, turns=3, answer="1")
+        return [{} for _ in harnesses for _ in tasks]
+    monkeypatch.setattr(loop, "run_probe", fake_probe)
+    run = loop.init_run(tmp_path / "run", suite, n_train=4, n_heldout=2, cache=tmp_path / "cache",
+                        probe={"tasks": 2, "base_url": "http://x"})
+    assert loop.step(run, editor=None) is False  # reference probed, waits for INV
+    assert calls == [["reference"]]
+    assert "probe/reference.md" in (run / "round-1" / "prompts" / "inv.md").read_text()
+    for _ in range(4):
+        loop.step(run, editor=None)
+        if (run / "library" / "EXPERIENCE.md").exists():
+            (run / "library" / "EXPERIENCE.md").write_text("Lesson: x\n")
+    assert calls[1] == ["dom", "inv", "reference"]
+    assert (run / "round-1" / "evidence" / "probe" / "CONTRAST.md").is_file()
+    assert "CONTRAST.md" in (run / "round-1" / "prompts" / "compose.md").read_text()
+    assert loop.step(run, editor=None) is True
+    # Without --probe, no probe stage and no probe text in the prompts
+    plain = loop.init_run(tmp_path / "plain", suite, n_train=4, n_heldout=2, cache=tmp_path / "cache")
+    loop.step(plain, editor=None)
+    assert "probe/" not in (plain / "round-1" / "prompts" / "inv.md").read_text()
+    assert "reference" not in json.loads((plain / "round-1" / "state.json").read_text())
